@@ -1043,6 +1043,7 @@ remove_mangle_chain_references() {
 
 uninstall_rules() {
   need_root
+  systemctl disable --now fwguard-firewall-repair.timer >/dev/null 2>&1 || true
   systemctl disable --now fwguard-ipset-refresh.timer >/dev/null 2>&1 || true
   systemctl disable --now fwguard-ipset-refresh.service >/dev/null 2>&1 || true
   systemctl disable --now fwguard-ipset-restore.service >/dev/null 2>&1 || true
@@ -1081,7 +1082,7 @@ uninstall_rules() {
   done
   rm -f "$IPSET_PERSIST_FILE" "$LEGACY_IPSET_PERSIST_FILE" "$STATE_DIR/pmtu-mss.conf"
   rm -rf "$STATE_DIR"
-  rm -f /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf
+  rm -f /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/fwguard-firewall-repair.service /etc/systemd/system/fwguard-firewall-repair.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf
   rmdir /etc/systemd/system/netfilter-persistent.service.d 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
   persist_rules
@@ -1239,10 +1240,36 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+  run tee /etc/systemd/system/fwguard-firewall-repair.service >/dev/null <<EOF
+[Unit]
+Description=在 1Panel 防火墙加载后恢复 fwguard 规则
+After=network-online.target 1panel.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_PATH repair
+EOF
+
+  run tee /etc/systemd/system/fwguard-firewall-repair.timer >/dev/null <<EOF
+[Unit]
+Description=检查并恢复 fwguard 防火墙规则
+
+[Timer]
+OnBootSec=75sec
+OnUnitActiveSec=60sec
+AccuracySec=10sec
+Unit=fwguard-firewall-repair.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
   run systemctl daemon-reload
   run systemctl enable fwguard-ipset-restore.service
   run systemctl restart fwguard-ipset-restore.service
   run systemctl enable --now fwguard-ipset-refresh.timer
+  run systemctl enable --now fwguard-firewall-repair.timer
   run systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
 }
 
@@ -1264,6 +1291,50 @@ load_config_if_present() {
   IPSET_PERSIST_FILE="$PERSIST_DIR/ipsets"
   LEGACY_IPSET_PERSIST_FILE="$PERSIST_DIR/ipsets.rules"
   CONFIRM_FILE="$WORKDIR/confirm-keep-rules"
+}
+
+repair_firewall_rules() {
+  need_root
+  load_config_if_present
+  validate_ssh_port "${SSH_PORT:-22}"
+  SSH_PORT="${SSH_PORT:-22}"
+
+  if ! ipset list "$IPSET_CF4" >/dev/null 2>&1 || ! ipset list "$IPSET_CN4" >/dev/null 2>&1; then
+    echo "ERROR: required fwguard IPv4 sets are missing; run apply or refresh to rebuild them." >&2
+    return 1
+  fi
+  if [[ "$ENABLE_IPV6" == "1" ]] && { ! ipset list "$IPSET_CF6" >/dev/null 2>&1 || ! ipset list "$IPSET_CN6" >/dev/null 2>&1; }; then
+    echo "ERROR: required fwguard IPv6 sets are missing; run apply or refresh to rebuild them." >&2
+    return 1
+  fi
+
+  for chain in "$CHAIN_V4" "$CHAIN_ICMP_V4"; do
+    iptables -N "$chain" 2>/dev/null || true
+  done
+  if [[ "$ENABLE_IPV6" == "1" ]] && command -v ip6tables >/dev/null 2>&1; then
+    for chain in "$CHAIN_V6" "$CHAIN_ICMP_V6"; do
+      ip6tables -N "$chain" 2>/dev/null || true
+    done
+  fi
+  apply_ipv4_rules
+  apply_ipv6_rules
+  if [[ -f "$STATE_DIR/pmtu-mss.conf" ]]; then
+    source "$STATE_DIR/pmtu-mss.conf"
+    if [[ "${PMTU_IPV4_MSS:-}" =~ ^[0-9]+$ ]]; then
+      run iptables -t mangle -N VPSC_MSS 2>/dev/null || true
+      run iptables -t mangle -F VPSC_MSS
+      run iptables -t mangle -A VPSC_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$PMTU_IPV4_MSS"
+      run iptables -t mangle -C POSTROUTING -j VPSC_MSS 2>/dev/null || run iptables -t mangle -A POSTROUTING -j VPSC_MSS
+    fi
+    if [[ "$ENABLE_IPV6" == "1" ]] && command -v ip6tables >/dev/null 2>&1 && [[ "${PMTU_IPV6_MSS:-}" =~ ^[0-9]+$ ]]; then
+      run ip6tables -t mangle -N VPSC_MSS 2>/dev/null || true
+      run ip6tables -t mangle -F VPSC_MSS
+      run ip6tables -t mangle -A VPSC_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$PMTU_IPV6_MSS"
+      run ip6tables -t mangle -C POSTROUTING -j VPSC_MSS 2>/dev/null || run ip6tables -t mangle -A POSTROUTING -j VPSC_MSS
+    fi
+  fi
+
+  persist_rules
 }
 
 refresh_ipsets() {
@@ -1582,6 +1653,7 @@ main() {
     confirm) confirm_rules ;;
     rollback) rollback_latest ;;
     refresh) refresh_ipsets ;;
+    repair) repair_firewall_rules ;;
     diagnose|diag) diagnose_rules ;;
     uninstall)
       if [[ "${BASH_SOURCE[0]}" != "$INSTALL_PATH" ]]; then

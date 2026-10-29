@@ -4,7 +4,7 @@ set -e
 ### ===== 基本信息 =====
 SCRIPT_NAME="vps-secure.sh"
 REPO_RAW="https://raw.githubusercontent.com/avsba001/vps-secure/main"
-LOCAL_VERSION="1.0.30"
+LOCAL_VERSION="1.0.31"
 
 ### ===== 防止无限自更新 =====
 if [ "$VPS_SECURE_UPDATED" != "1" ]; then
@@ -48,7 +48,7 @@ backup_paths_for_step() {
       echo "/etc/fail2ban/jail.local /etc/fail2ban/filter.d/sshd-disconnect.conf /etc/fail2ban/f2b-cloudflare-ipset-whitelist.enabled"
       ;;
     6)
-      echo ""
+      echo "/usr/local/sbin/fwguard-firewall /etc/fwguard-ipset/config /etc/fwguard-ipset/pmtu-mss.conf /etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/iptables/ipsets /etc/iptables/ipsets.rules /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf"
       ;;
     7)
       echo "/usr/local/sbin/fwguard-firewall /etc/fwguard-ipset/config /etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/iptables/ipsets /etc/iptables/ipsets.rules /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf"
@@ -117,12 +117,13 @@ restore_from_backup() {
       systemctl restart fail2ban >/dev/null 2>&1 || true
       ;;
     6)
-      PMTU_MTU="${PMTU_MTU:-1480}"
-      PMTU_IPV4_MSS=$((PMTU_MTU - 40))
-      PMTU_IPV6_MSS=$((PMTU_MTU - 60))
-      while iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$PMTU_IPV4_MSS" >/dev/null 2>&1; do :; done
-      while ip6tables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$PMTU_IPV6_MSS" >/dev/null 2>&1; do :; done
-      netfilter-persistent save >/dev/null 2>&1 || true
+      [ -f "$dir/etc/iptables/rules.v4" ] && iptables-restore < "$dir/etc/iptables/rules.v4" || true
+      if command -v ip6tables-restore >/dev/null 2>&1 && [ -f "$dir/etc/iptables/rules.v6" ]; then
+        ip6tables-restore < "$dir/etc/iptables/rules.v6" || true
+      fi
+      [ -f "$dir/etc/iptables/ipsets" ] && ipset restore -exist < "$dir/etc/iptables/ipsets" || true
+      systemctl disable --now fwguard-ipset-refresh.timer >/dev/null 2>&1 || true
+      systemctl disable --now fwguard-ipset-restore.service >/dev/null 2>&1 || true
       ;;
     7)
       if [ -x /usr/local/sbin/fwguard-firewall ]; then
@@ -234,49 +235,14 @@ uninstall_fail2ban_config() {
   echo "✅ 已卸载 Fail2Ban 的本项目配置，未删除 fail2ban/ufw/ipset 软件包"
 }
 
-uninstall_pmtu_mss() {
-  local mtu ipv4_mss ipv6_mss
-
-  mtu="${PMTU_MTU:-1480}"
-  ipv4_mss=$((mtu - 40))
-  ipv6_mss=$((mtu - 60))
-  while iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$ipv4_mss" >/dev/null 2>&1; do :; done
-  while ip6tables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$ipv6_mss" >/dev/null 2>&1; do :; done
-  netfilter-persistent save >/dev/null 2>&1 || true
-  echo "✅ 已卸载 PMTU MSS 规则"
-}
 
 uninstall_cloudflare_ssh() {
-  systemctl disable --now fwguard-ipset-refresh.timer >/dev/null 2>&1 || true
-  systemctl disable --now fwguard-ipset-refresh.service >/dev/null 2>&1 || true
-  systemctl disable --now fwguard-ipset-restore.service >/dev/null 2>&1 || true
-  delete_chain iptables "" SSH_CF_ASN_GUARD
-  delete_chain iptables "" SSH_CF_CN_GUARD
-  delete_chain iptables "" CN_ICMP_DROP
-  delete_chain ip6tables "" SSH_CF_ASN_GUARD_V6
-  delete_chain ip6tables "" SSH_CF_CN_GUARD_V6
-  delete_chain ip6tables "" CN_ICMP_DROP_V6
-  delete_ipset fwguard_cn_ipv4
-  delete_ipset fwguard_cn_ipv6
-  delete_ipset fwguard_cloudflare_ipv4
-  delete_ipset fwguard_cloudflare_ipv6
-  delete_ipset fwguard_ssh_cn_ipv4
-  delete_ipset fwguard_ssh_cn_ipv6
-  for set_name in $(ipset list -name 2>/dev/null | grep '^fwguard_' || true); do
-    delete_ipset "$set_name"
-  done
-  rm -f /usr/local/sbin/fwguard-firewall
-  rm -rf /etc/fwguard-ipset
-  rm -f /etc/systemd/system/fwguard-ipset-restore.service
-  rm -f /etc/systemd/system/fwguard-ipset-refresh.service
-  rm -f /etc/systemd/system/fwguard-ipset-refresh.timer
-  rm -f /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf
-  rmdir /etc/systemd/system/netfilter-persistent.service.d >/dev/null 2>&1 || true
-  rm -f /etc/iptables/ipsets /etc/iptables/ipsets.rules
-  iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-  ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  echo "✅ 已卸载 Cloudflare SSH 白名单和中国 ICMP 屏蔽配置"
+  if [ -x /usr/local/sbin/fwguard-firewall ]; then
+    /usr/local/sbin/fwguard-firewall uninstall
+  else
+    echo "[ERROR] Unified firewall script is not installed; use rollback step 6 to restore the previous snapshot."
+    return 1
+  fi
 }
 
 uninstall_menu() {
@@ -287,8 +253,7 @@ uninstall_menu() {
   echo "说明：只删除本项目创建的配置、服务、辅助脚本和防火墙规则，不卸载依赖软件包。"
   echo "1) 卸载 CAKE 配置"
   echo "3) 卸载 Fail2Ban 本项目配置"
-  echo "6) 卸载 PMTU MSS 规则"
-  echo "7) 卸载 Cloudflare SSH 白名单 + 中国 ICMP 屏蔽"
+  echo "6) 卸载统一防火墙与 MSS 配置"
   echo "9) 卸载全部可卸载配置"
   echo "0) 返回"
   read -rp "请选择要卸载的项目: " choice
@@ -296,15 +261,13 @@ uninstall_menu() {
   case "$choice" in
     1) uninstall_cake ;;
     3) uninstall_fail2ban_config ;;
-    6) uninstall_pmtu_mss ;;
-    7) uninstall_cloudflare_ssh ;;
+    6) uninstall_cloudflare_ssh ;;
     9)
       read -rp "确认卸载全部可卸载配置？这不会卸载依赖软件包。(y=确认 / n=取消) [默认: n]: " confirm
       case "${confirm:-n}" in
         [Yy])
           uninstall_cake
           uninstall_fail2ban_config
-          uninstall_pmtu_mss
           uninstall_cloudflare_ssh
           ;;
         *)
@@ -323,12 +286,11 @@ rollback_menu() {
   echo "1) 撤销 SSH 安全配置"
   echo "2) 撤销 CAKE 配置"
   echo "3) 撤销 Fail2Ban 配置"
-  echo "6) 撤销 PMTU MSS 设置"
-  echo "7) 撤销 Cloudflare SSH 防火墙规则"
+  echo "6) 撤销统一防火墙与 MSS 配置"
   echo "0) 返回"
   read -rp "请选择要撤销的步骤: " rb
   case "$rb" in
-    1|2|3|6|7)
+    1|2|3|6)
       restore_from_backup "$rb"
       ;;
     0)
@@ -363,7 +325,7 @@ run_script_without_backup() {
   echo ">>> $script 执行完成"
 }
 
-VERSION="1.0.30"
+VERSION="1.0.31"
 
 while true; do
   echo
@@ -375,8 +337,7 @@ while true; do
   echo "2) CAKE 队列配置"
   echo "3) Fail2Ban 防爆破（非常严格）"
   echo "4) XanMod Cloud 精简内核安装"
-  echo "6) PMTU MSS 自动修正（iptables mangle）"
-  echo "7) Cloudflare ASN SSH 白名单（可加中国/省份）+ 中国 ICMP 屏蔽"
+  echo "6) Cloudflare SSH 防火墙 + 国内 IPv4/IPv6 MTU/MSS 优化"
   echo "8) 检查当前 SSH 白名单 IP 段归属"
   echo "9) 全部执行"
   echo "10) 撤销修改（从最近备份恢复）"
@@ -399,11 +360,8 @@ while true; do
       echo "[INFO] XanMod 安装不提供自动回滚，继续执行。"
       run_script_without_backup "xanmod.sh"
       ;;
-    6)
-      run_step 6 "pmtu-mss.sh"
-      ;;
-    7)
-      run_step 7 "cloudflare-ssh.sh"
+    6|7)
+      run_step 6 "cloudflare-ssh.sh"
       ;;
     8)
       run_script_without_backup "ssh-whitelist-check.sh"
@@ -414,8 +372,7 @@ while true; do
       run_step 3 "fail2ban.sh"
       echo "[INFO] XanMod 安装不提供自动回滚，继续执行。"
       run_script_without_backup "xanmod.sh"
-      run_step 6 "pmtu-mss.sh"
-      run_step 7 "cloudflare-ssh.sh"
+      run_step 6 "cloudflare-ssh.sh"
       ;;
     10)
       rollback_menu

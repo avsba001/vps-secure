@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -Eeuo pipefail
 
 # Debian 12 防火墙保护脚本：
@@ -9,7 +9,7 @@ set -Eeuo pipefail
 # 5. 持久化规则、定时更新 IP 段，并在异常时自动回滚。
 
 SSH_PORT="${SSH_PORT:-}"
-ROLLBACK_SECONDS="${ROLLBACK_SECONDS:-180}"
+ROLLBACK_SECONDS="${ROLLBACK_SECONDS:-300}"
 ALLOW_ESTABLISHED="${ALLOW_ESTABLISHED:-1}"
 ENABLE_IPV6="${ENABLE_IPV6:-1}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -25,6 +25,14 @@ CLOUDFLARE_ASN_AUTO_UPDATE="${CLOUDFLARE_ASN_AUTO_UPDATE:-1}"
 RIPESTAT_ASN_SEARCH_URL="${RIPESTAT_ASN_SEARCH_URL:-https://stat.ripe.net/data/searchcomplete/data.json}"
 RIPESTAT_ANNOUNCED_PREFIXES_URL="${RIPESTAT_ANNOUNCED_PREFIXES_URL:-https://stat.ripe.net/data/announced-prefixes/data.json}"
 CONNECTIVITY_TARGETS="${CONNECTIVITY_TARGETS:-1.1.1.1 8.8.8.8}"
+PMTU_MTU="${PMTU_MTU:-}"
+PMTU_IPV4_MTU="${PMTU_IPV4_MTU:-}"
+PMTU_IPV6_MTU="${PMTU_IPV6_MTU:-}"
+PMTU_IPV4_TARGETS="${PMTU_IPV4_TARGETS:-223.5.5.5 119.29.29.29}"
+PMTU_IPV6_TARGETS="${PMTU_IPV6_TARGETS:-2400:3200::1 2402:4e00::}"
+PMTU_FALLBACK_MTU="${PMTU_FALLBACK_MTU:-1480}"
+PMTU_IPV4_MSS="${PMTU_IPV4_MSS:-}"
+PMTU_IPV6_MSS="${PMTU_IPV6_MSS:-}"
 
 WORKDIR="${WORKDIR:-/var/tmp/firewall-ipset-guard}"
 STATE_DIR="${STATE_DIR:-/etc/fwguard-ipset}"
@@ -396,6 +404,7 @@ backup_rules() {
 
   backup_file "$PERSIST_DIR/rules.v4"
   backup_file "$PERSIST_DIR/rules.v6"
+  backup_file "$STATE_DIR/pmtu-mss.conf"
   backup_file "$IPSET_PERSIST_FILE"
   backup_file "$LEGACY_IPSET_PERSIST_FILE"
   backup_file "$STATE_DIR/config"
@@ -853,6 +862,104 @@ apply_ipv4_rules() {
   warn_early_ssh_accepts iptables "$CHAIN_V4" "$SSH_PORT"
 }
 
+probe_path_mtu() {
+  local family="$1" target="$2" low high mid best payload flag
+  if [[ "$family" == "4" ]]; then
+    low=68; high=9000; flag="-4"
+  else
+    low=1280; high=9000; flag="-6"
+  fi
+  best=0
+  while (( low <= high )); do
+    mid=$(((low + high) / 2))
+    payload=$((mid - 28))
+    [[ "$family" == "6" ]] && payload=$((mid - 48))
+    if ping "$flag" -M do -c 1 -W 1 -s "$payload" "$target" >/dev/null 2>&1; then
+      best="$mid"; low=$((mid + 1))
+    else
+      high=$((mid - 1))
+    fi
+  done
+  (( best > 0 )) && printf '%s\n' "$best"
+}
+
+measure_family_mtu() {
+  local family="$1" targets="$2" target measured best=0
+  for target in $targets; do
+    measured="$(probe_path_mtu "$family" "$target" || true)"
+    if [[ "$measured" =~ ^[0-9]+$ ]] && (( measured > best )); then best="$measured"; fi
+  done
+  (( best > 0 )) && printf '%s\n' "$best"
+}
+
+configure_mss_rules() {
+  local mtu4="" mtu6=""
+  [[ "$PMTU_FALLBACK_MTU" =~ ^[0-9]+$ ]] && (( PMTU_FALLBACK_MTU >= 1280 && PMTU_FALLBACK_MTU <= 65535 )) || { echo "ERROR: PMTU_FALLBACK_MTU must be 1280..65535." >&2; exit 2; }
+  local -a targets4=() targets6=()
+
+  if [[ -n "$PMTU_MTU" ]]; then
+    [[ "$PMTU_MTU" =~ ^[0-9]+$ ]] && (( PMTU_MTU >= 576 && PMTU_MTU <= 65535 )) || { echo "ERROR: PMTU_MTU must be 576..65535." >&2; exit 2; }
+    mtu4="$PMTU_MTU"
+    mtu6="$PMTU_MTU"
+  else
+    if [[ -n "$PMTU_IPV4_MTU" ]]; then
+      [[ "$PMTU_IPV4_MTU" =~ ^[0-9]+$ ]] && (( PMTU_IPV4_MTU >= 576 && PMTU_IPV4_MTU <= 65535 )) || { echo "ERROR: PMTU_IPV4_MTU is invalid." >&2; exit 2; }
+      mtu4="$PMTU_IPV4_MTU"
+    else
+      read -r -a targets4 <<< "$PMTU_IPV4_TARGETS"
+      mtu4="$(measure_family_mtu 4 "${targets4[*]}")"
+    fi
+    if [[ "$ENABLE_IPV6" != "1" ]]; then
+      mtu6=1280
+    elif [[ -n "$PMTU_IPV6_MTU" ]]; then
+      [[ "$PMTU_IPV6_MTU" =~ ^[0-9]+$ ]] && (( PMTU_IPV6_MTU >= 1280 && PMTU_IPV6_MTU <= 65535 )) || { echo "ERROR: PMTU_IPV6_MTU is invalid." >&2; exit 2; }
+      mtu6="$PMTU_IPV6_MTU"
+    else
+      read -r -a targets6 <<< "$PMTU_IPV6_TARGETS"
+      mtu6="$(measure_family_mtu 6 "${targets6[*]}")"
+    fi
+  fi
+
+  if [[ ! "$mtu4" =~ ^[0-9]+$ ]]; then
+    if [[ -f "$STATE_DIR/pmtu-mss.conf" ]] && source "$STATE_DIR/pmtu-mss.conf" && [[ "${PMTU_IPV4_MSS:-}" =~ ^[0-9]+$ ]]; then
+      echo "WARNING: IPv4 MTU probe failed; reusing the last saved MSS." >&2
+      mtu4=$((PMTU_IPV4_MSS + 40))
+    else
+      echo "WARNING: IPv4 China-route MTU probe failed; falling back to $PMTU_FALLBACK_MTU." >&2
+      mtu4="$PMTU_FALLBACK_MTU"
+    fi
+  fi
+  if [[ "$ENABLE_IPV6" == "1" && ! "$mtu6" =~ ^[0-9]+$ ]]; then
+    if [[ -f "$STATE_DIR/pmtu-mss.conf" ]] && source "$STATE_DIR/pmtu-mss.conf" && [[ "${PMTU_IPV6_MSS:-}" =~ ^[0-9]+$ ]]; then
+      echo "WARNING: IPv6 MTU probe failed; reusing the last saved MSS." >&2
+      mtu6=$((PMTU_IPV6_MSS + 60))
+    else
+      echo "WARNING: IPv6 China-route MTU probe failed; falling back to $PMTU_FALLBACK_MTU." >&2
+      mtu6="$PMTU_FALLBACK_MTU"
+    fi
+    (( mtu6 >= 1280 )) || mtu6=1280
+  fi
+  [[ "$mtu4" =~ ^[0-9]+$ ]] && (( mtu4 >= 576 && mtu4 <= 65535 )) || { echo "ERROR: IPv4 MTU is invalid." >&2; exit 2; }
+  if [[ "$ENABLE_IPV6" == "1" ]]; then
+    [[ "$mtu6" =~ ^[0-9]+$ ]] && (( mtu6 >= 1280 && mtu6 <= 65535 )) || { echo "ERROR: IPv6 MTU is invalid." >&2; exit 2; }
+  fi
+  PMTU_IPV4_MSS=$((mtu4 - 40))
+  PMTU_IPV6_MSS=0
+  [[ "$ENABLE_IPV6" == "1" ]] && PMTU_IPV6_MSS=$((mtu6 - 60))
+  echo "TCP MSS: IPv4 MTU=$mtu4 MSS=$PMTU_IPV4_MSS; IPv6 MTU=$mtu6 MSS=$PMTU_IPV6_MSS"
+
+  run iptables -t mangle -N VPSC_MSS 2>/dev/null || true
+  run iptables -t mangle -F VPSC_MSS
+  run iptables -t mangle -A VPSC_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$PMTU_IPV4_MSS"
+  run iptables -t mangle -C POSTROUTING -j VPSC_MSS 2>/dev/null || run iptables -t mangle -A POSTROUTING -j VPSC_MSS
+  if [[ "$ENABLE_IPV6" == "1" ]] && command -v ip6tables >/dev/null 2>&1; then
+    run ip6tables -t mangle -N VPSC_MSS 2>/dev/null || true
+    run ip6tables -t mangle -F VPSC_MSS
+    run ip6tables -t mangle -A VPSC_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$PMTU_IPV6_MSS"
+    run ip6tables -t mangle -C POSTROUTING -j VPSC_MSS 2>/dev/null || run ip6tables -t mangle -A POSTROUTING -j VPSC_MSS
+  fi
+}
+
 apply_ipv6_rules() {
   if [[ "$ENABLE_IPV6" != "1" ]]; then
     command -v ip6tables >/dev/null 2>&1 || return 0
@@ -891,6 +998,62 @@ apply_ipv6_rules() {
   ensure_1panel_ssh_guard_hooks ip6tables "$CHAIN_V6" "$SSH_PORT"
   ensure_jump ip6tables "$CHAIN_ICMP_V6" ipv6-icmp 3
   warn_early_ssh_accepts ip6tables "$CHAIN_V6" "$SSH_PORT"
+}
+
+remove_mangle_chain_references() {
+  local table_cmd="$1"
+  local chain="$2"
+  local spec
+
+  while true; do
+    spec="$("$table_cmd" -t mangle -S POSTROUTING 2>/dev/null | grep -- "-j $chain" | head -n 1 | sed 's/^-A POSTROUTING /-D POSTROUTING /' || true)"
+    [[ -n "$spec" ]] || break
+    # shellcheck disable=SC2086
+    "$table_cmd" -t mangle $spec >/dev/null 2>&1 || break
+  done
+}
+
+uninstall_rules() {
+  need_root
+  systemctl disable --now fwguard-ipset-refresh.timer >/dev/null 2>&1 || true
+  systemctl disable --now fwguard-ipset-refresh.service >/dev/null 2>&1 || true
+  systemctl disable --now fwguard-ipset-restore.service >/dev/null 2>&1 || true
+  remove_input_jumps_to_chain iptables "$CHAIN_V4"
+  remove_input_jumps_to_chain iptables "$CHAIN_ICMP_V4"
+  if command -v ip6tables >/dev/null 2>&1; then
+    remove_input_jumps_to_chain ip6tables "$CHAIN_V6"
+    remove_input_jumps_to_chain ip6tables "$CHAIN_ICMP_V6"
+  fi
+  for chain in "$CHAIN_V4" "$CHAIN_ICMP_V4" "$LEGACY_CHAIN_V4"; do
+    iptables -F "$chain" 2>/dev/null || true
+    iptables -X "$chain" 2>/dev/null || true
+  done
+  for chain in "$CHAIN_V6" "$CHAIN_ICMP_V6" "$LEGACY_CHAIN_V6"; do
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -F "$chain" 2>/dev/null || true
+      ip6tables -X "$chain" 2>/dev/null || true
+    fi
+  done
+  remove_mangle_chain_references iptables VPSC_MSS
+  if command -v ip6tables >/dev/null 2>&1; then
+    remove_mangle_chain_references ip6tables VPSC_MSS
+  fi
+  iptables -t mangle -F VPSC_MSS 2>/dev/null || true
+  iptables -t mangle -X VPSC_MSS 2>/dev/null || true
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -t mangle -F VPSC_MSS 2>/dev/null || true
+    ip6tables -t mangle -X VPSC_MSS 2>/dev/null || true
+  fi
+  for set_name in "$IPSET_CN4" "$IPSET_CN6" "$IPSET_CF4" "$IPSET_CF6" "$IPSET_SSH_CN4" "$IPSET_SSH_CN6"; do
+    ipset destroy "$set_name" 2>/dev/null || true
+  done
+  rm -f "$IPSET_PERSIST_FILE" "$LEGACY_IPSET_PERSIST_FILE" "$STATE_DIR/pmtu-mss.conf"
+  rm -rf "$STATE_DIR"
+  rm -f /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf
+  rmdir /etc/systemd/system/netfilter-persistent.service.d 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  persist_rules
+  echo "Firewall and MSS rules removed; unrelated firewall rules preserved."
 }
 
 remove_legacy_country_whitelists() {
@@ -949,6 +1112,8 @@ CLOUDFLARE_ASN_AUTO_UPDATE="$CLOUDFLARE_ASN_AUTO_UPDATE"
 RIPESTAT_ASN_SEARCH_URL="$RIPESTAT_ASN_SEARCH_URL"
 RIPESTAT_ANNOUNCED_PREFIXES_URL="$RIPESTAT_ANNOUNCED_PREFIXES_URL"
 CONNECTIVITY_TARGETS="$CONNECTIVITY_TARGETS"
+PMTU_IPV4_MSS="$PMTU_IPV4_MSS"
+PMTU_IPV6_MSS="$PMTU_IPV6_MSS"
 WORKDIR="$WORKDIR"
 STATE_DIR="$STATE_DIR"
 PERSIST_DIR="$PERSIST_DIR"
@@ -1328,6 +1493,8 @@ apply_rules() {
   download_lists
   set_stage "载入 ipset 集合"
   load_ipsets
+  set_stage "MTU/MSS auto-detection and setup"
+  configure_mss_rules
   set_stage "应用 IPv4 防火墙规则"
   apply_ipv4_rules
   set_stage "应用 IPv6 防火墙规则"
@@ -1338,6 +1505,8 @@ apply_rules() {
   connectivity_check
   set_stage "写入配置和持久化规则"
   write_config
+  printf 'PMTU_IPV4_MSS=%s\nPMTU_IPV6_MSS=%s\n' "$PMTU_IPV4_MSS" "$PMTU_IPV6_MSS" > "$STATE_DIR/pmtu-mss.conf"
+  chmod 600 "$STATE_DIR/pmtu-mss.conf"
   persist_rules
   set_stage "安装脚本和 systemd 定时任务"
   install_self
@@ -1367,6 +1536,10 @@ usage() {
   CLOUDFLARE_ASN_AUTO_UPDATE=0      关闭 ASN 自动发现，固定使用配置清单
   ROLLBACK_SECONDS=300             未确认时等待多少秒后回滚
   ENABLE_IPV6=0                    禁用 IPv6 规则
+  PMTU_MTU=1460                    Set both address-family MTUs manually
+  PMTU_IPV4_MTU / PMTU_IPV6_MTU    Set each family MTU separately
+  PMTU_IPV4_TARGETS / PMTU_IPV6_TARGETS  China-route MTU probe targets
+  PMTU_FALLBACK_MTU=1480           Fallback when probing fails
   DRY_RUN=1                        尽可能只显示将执行的命令
 EOF
 }
@@ -1378,6 +1551,13 @@ main() {
     rollback) rollback_latest ;;
     refresh) refresh_ipsets ;;
     diagnose|diag) diagnose_rules ;;
+    uninstall)
+      if [[ "${BASH_SOURCE[0]}" != "$INSTALL_PATH" ]]; then
+        install -m 0755 "${BASH_SOURCE[0]}" "$INSTALL_PATH"
+        exec "$INSTALL_PATH" uninstall
+      fi
+      uninstall_rules
+      ;;
     -h|--help|help) usage ;;
     *)
       usage >&2

@@ -4,7 +4,7 @@ set -e
 ### ===== 基本信息 =====
 SCRIPT_NAME="vps-secure.sh"
 REPO_RAW="https://raw.githubusercontent.com/avsba001/vps-secure/main"
-LOCAL_VERSION="1.0.31"
+LOCAL_VERSION="1.0.32"
 
 ### ===== 防止无限自更新 =====
 if [ "$VPS_SECURE_UPDATED" != "1" ]; then
@@ -48,10 +48,10 @@ backup_paths_for_step() {
       echo "/etc/fail2ban/jail.local /etc/fail2ban/filter.d/sshd-disconnect.conf /etc/fail2ban/f2b-cloudflare-ipset-whitelist.enabled"
       ;;
     6)
-      echo "/usr/local/sbin/fwguard-firewall /etc/fwguard-ipset/config /etc/fwguard-ipset/pmtu-mss.conf /etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/iptables/ipsets /etc/iptables/ipsets.rules /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf"
+      echo "/usr/local/sbin/fwguard-firewall /etc/fwguard-ipset/config /etc/fwguard-ipset/pmtu-mss.conf /etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/iptables/ipsets /etc/iptables/ipsets.rules /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/fwguard-firewall-repair.service /etc/systemd/system/fwguard-firewall-repair.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf"
       ;;
     7)
-      echo "/usr/local/sbin/fwguard-firewall /etc/fwguard-ipset/config /etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/iptables/ipsets /etc/iptables/ipsets.rules /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf"
+      echo "/usr/local/sbin/fwguard-firewall /etc/fwguard-ipset/config /etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/iptables/ipsets /etc/iptables/ipsets.rules /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/fwguard-firewall-repair.service /etc/systemd/system/fwguard-firewall-repair.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf"
       ;;
     *)
       echo ""
@@ -140,6 +140,8 @@ restore_from_backup() {
         [ -f "$dir/etc/systemd/system/fwguard-ipset-restore.service" ] && cp -a "$dir/etc/systemd/system/fwguard-ipset-restore.service" /etc/systemd/system/fwguard-ipset-restore.service
         [ -f "$dir/etc/systemd/system/fwguard-ipset-refresh.service" ] && cp -a "$dir/etc/systemd/system/fwguard-ipset-refresh.service" /etc/systemd/system/fwguard-ipset-refresh.service
         [ -f "$dir/etc/systemd/system/fwguard-ipset-refresh.timer" ] && cp -a "$dir/etc/systemd/system/fwguard-ipset-refresh.timer" /etc/systemd/system/fwguard-ipset-refresh.timer
+        [ -f "$dir/etc/systemd/system/fwguard-firewall-repair.service" ] && cp -a "$dir/etc/systemd/system/fwguard-firewall-repair.service" /etc/systemd/system/fwguard-firewall-repair.service
+        [ -f "$dir/etc/systemd/system/fwguard-firewall-repair.timer" ] && cp -a "$dir/etc/systemd/system/fwguard-firewall-repair.timer" /etc/systemd/system/fwguard-firewall-repair.timer
         [ -f "$dir/etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf" ] && mkdir -p /etc/systemd/system/netfilter-persistent.service.d && cp -a "$dir/etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf" /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf
         systemctl daemon-reload
         [ -f /etc/iptables/ipsets ] && ipset restore -exist < /etc/iptables/ipsets >/dev/null 2>&1 || true
@@ -147,6 +149,7 @@ restore_from_backup() {
         [ -f /etc/iptables/rules.v6 ] && ip6tables-restore < /etc/iptables/rules.v6 >/dev/null 2>&1 || true
         [ -f /etc/systemd/system/fwguard-ipset-restore.service ] && systemctl enable --now fwguard-ipset-restore.service >/dev/null 2>&1 || true
         [ -f /etc/systemd/system/fwguard-ipset-refresh.timer ] && systemctl enable --now fwguard-ipset-refresh.timer >/dev/null 2>&1 || true
+        [ -f /etc/systemd/system/fwguard-firewall-repair.timer ] && systemctl enable --now fwguard-firewall-repair.timer >/dev/null 2>&1 || true
       fi
       ;;
     *)
@@ -325,7 +328,7 @@ run_script_without_backup() {
   echo ">>> $script 执行完成"
 }
 
-VERSION="1.0.31"
+VERSION="1.0.32"
 
 while true; do
   echo

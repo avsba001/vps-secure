@@ -37,7 +37,7 @@ bash <(curl -sL https://gh-proxy.com/https://raw.githubusercontent.com/avsba001/
 - “卸载脚本配置”用于删除本项目创建的配置和规则，不删除 `fail2ban`、`ufw`、`ipset`、`iptables-persistent` 等依赖软件包。
 - `xanmod.sh` 安装内核后需要重启系统才能加载新内核，主脚本不提供自动回滚。
 - `cloudflare-ssh.sh` 自带回滚保护。应用后请按脚本提示确认 SSH 和网络正常，再执行确认命令保留规则。
-- The unified script applies and persists Cloudflare firewall and MSS rules together. If MTU is omitted, it probes IPv4 and IPv6 China-route targets separately; `PMTU_MTU`, `PMTU_IPV4_MTU`, and `PMTU_IPV6_MTU` override detection. `PMTU_FALLBACK_MTU` defaults to 1480 and is reported when probing fails.
+- The unified script applies and persists Cloudflare firewall and MSS rules together. If MTU is omitted, it probes IPv4 and IPv6 China-route targets separately; `PMTU_MTU`, `PMTU_IPV4_MTU`, and `PMTU_IPV6_MTU` override detection. `PMTU_FALLBACK_MTU` defaults to 1480 and is reported when probing fails. A systemd repair timer reapplies the hooks about 75 seconds after boot and every minute, covering firewall reloads by 1Panel.
 - 中国 IP ICMP 屏蔽已合并到 `cloudflare-ssh.sh`，不再提供独立 `cn-ipset.sh`。
 - 部分辅助脚本会检查当前 `iptables` 后端；`cloudflare-ssh.sh` 已恢复为最早版本的 iptables 规则流程，并在此基础上提供可选中国/省份 SSH 白名单。
 - 如果 SSH 白名单看起来未生效，可运行菜单 8 检查端口、链挂接、同端口提前放行规则和 ipset 归属；当前已建立的 SSH 连接会被已建立连接规则继续放行，请用新连接验证。

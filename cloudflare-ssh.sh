@@ -742,29 +742,33 @@ ensure_ssh_guard_jump() {
   ensure_jump "$table_cmd" "$chain" tcp "$position" --dport "$port"
 }
 
-ensure_1panel_ssh_guard_hooks() {
+ensure_1panel_guard_hooks() {
   local table_cmd="$1"
   local chain="$2"
-  local port="$3"
-  local panel_chain line has_ssh_accept accept_position rule_number
+  local protocol="$3"
+  local port="${4:-}"
+  local panel_chain line has_accept accept_position rule_number
+  local hook_spec=("-p" "$protocol")
+  local match_pattern="-p $protocol"
 
-  # 1Panel may place its own INPUT chains before the top-level jump. Hook
-  # those chains as well so their SSH ACCEPT rules cannot bypass the guard.
+  if [[ -n "$port" ]]; then
+    hook_spec+=(--dport "$port")
+    match_pattern+=".*--dport $port"
+  fi
+
   while IFS= read -r panel_chain; do
     [[ -n "$panel_chain" ]] || continue
-    has_ssh_accept=0
+    has_accept=0
     while IFS= read -r line; do
-      if [[ "$line" == *"--dport $port"*"-j ACCEPT"* ]]; then
-        has_ssh_accept=1
+      if [[ "$line" =~ $match_pattern.*-j[[:space:]]ACCEPT ]]; then
+        has_accept=1
         break
       fi
     done < <("$table_cmd" -S "$panel_chain" 2>/dev/null || true)
-    [[ "$has_ssh_accept" == "1" ]] || continue
+    [[ "$has_accept" == "1" ]] || continue
 
-    # Remove stale hooks first, then calculate the current position of the
-    # first SSH ACCEPT so loopback and established-state rules remain ahead.
-    while "$table_cmd" -C "$panel_chain" -p tcp --dport "$port" -j "$chain" >/dev/null 2>&1; do
-      run "$table_cmd" -D "$panel_chain" -p tcp --dport "$port" -j "$chain"
+    while "$table_cmd" -C "$panel_chain" "${hook_spec[@]}" -j "$chain" >/dev/null 2>&1; do
+      run "$table_cmd" -D "$panel_chain" "${hook_spec[@]}" -j "$chain"
       [[ "$DRY_RUN" == "1" ]] && break
     done
 
@@ -773,14 +777,36 @@ ensure_1panel_ssh_guard_hooks() {
     while IFS= read -r line; do
       [[ "$line" == -A\ * ]] || continue
       rule_number=$((rule_number + 1))
-      if [[ "$line" == *"--dport $port"*"-j ACCEPT"* ]]; then
+      if [[ "$line" =~ $match_pattern.*-j[[:space:]]ACCEPT ]]; then
         accept_position="$rule_number"
         break
       fi
     done < <("$table_cmd" -S "$panel_chain" 2>/dev/null || true)
     [[ "$accept_position" -gt 0 ]] || continue
-    run "$table_cmd" -I "$panel_chain" "$accept_position" -p tcp --dport "$port" -j "$chain"
-    echo "已在 1Panel 链 $panel_chain 的 SSH 放行规则前挂接 $chain"
+    run "$table_cmd" -I "$panel_chain" "$accept_position" "${hook_spec[@]}" -j "$chain"
+    echo "Hooked $chain before $protocol ACCEPT in 1Panel chain $panel_chain"
+  done < <("$table_cmd" -S 2>/dev/null \
+    | sed -n 's/^-N \(1PANEL_[^ ]*\)$/\1/p' \
+    | sort -u)
+}
+
+remove_1panel_guard_hooks() {
+  local table_cmd="$1"
+  local chain="$2"
+  local panel_chain spec
+
+  while IFS= read -r panel_chain; do
+    [[ -n "$panel_chain" ]] || continue
+    while true; do
+      spec="$("$table_cmd" -S "$panel_chain" 2>/dev/null \
+        | grep -- "-j $chain" \
+        | head -n 1 \
+        | sed "s/^-A $panel_chain /-D $panel_chain /" || true)"
+      [[ -n "$spec" ]] || break
+      # shellcheck disable=SC2086
+      run "$table_cmd" $spec
+      [[ "$DRY_RUN" == "1" ]] && break
+    done
   done < <("$table_cmd" -S 2>/dev/null \
     | sed -n 's/^-N \(1PANEL_[^ ]*\)$/\1/p' \
     | sort -u)
@@ -857,8 +883,9 @@ apply_ipv4_rules() {
   run iptables -A "$CHAIN_ICMP_V4" -j RETURN
 
   ensure_ssh_guard_jump iptables "$CHAIN_V4" "$SSH_PORT"
-  ensure_1panel_ssh_guard_hooks iptables "$CHAIN_V4" "$SSH_PORT"
+  ensure_1panel_guard_hooks iptables "$CHAIN_V4" tcp "$SSH_PORT"
   ensure_jump iptables "$CHAIN_ICMP_V4" icmp 3
+  ensure_1panel_guard_hooks iptables "$CHAIN_ICMP_V4" icmp
   warn_early_ssh_accepts iptables "$CHAIN_V4" "$SSH_PORT"
 }
 
@@ -995,8 +1022,9 @@ apply_ipv6_rules() {
   run ip6tables -A "$CHAIN_ICMP_V6" -j RETURN
 
   ensure_ssh_guard_jump ip6tables "$CHAIN_V6" "$SSH_PORT"
-  ensure_1panel_ssh_guard_hooks ip6tables "$CHAIN_V6" "$SSH_PORT"
+  ensure_1panel_guard_hooks ip6tables "$CHAIN_V6" tcp "$SSH_PORT"
   ensure_jump ip6tables "$CHAIN_ICMP_V6" ipv6-icmp 3
+  ensure_1panel_guard_hooks ip6tables "$CHAIN_ICMP_V6" ipv6-icmp
   warn_early_ssh_accepts ip6tables "$CHAIN_V6" "$SSH_PORT"
 }
 
@@ -1020,9 +1048,13 @@ uninstall_rules() {
   systemctl disable --now fwguard-ipset-restore.service >/dev/null 2>&1 || true
   remove_input_jumps_to_chain iptables "$CHAIN_V4"
   remove_input_jumps_to_chain iptables "$CHAIN_ICMP_V4"
+  remove_1panel_guard_hooks iptables "$CHAIN_V4"
+  remove_1panel_guard_hooks iptables "$CHAIN_ICMP_V4"
   if command -v ip6tables >/dev/null 2>&1; then
     remove_input_jumps_to_chain ip6tables "$CHAIN_V6"
     remove_input_jumps_to_chain ip6tables "$CHAIN_ICMP_V6"
+    remove_1panel_guard_hooks ip6tables "$CHAIN_V6"
+    remove_1panel_guard_hooks ip6tables "$CHAIN_ICMP_V6"
   fi
   for chain in "$CHAIN_V4" "$CHAIN_ICMP_V4" "$LEGACY_CHAIN_V4"; do
     iptables -F "$chain" 2>/dev/null || true

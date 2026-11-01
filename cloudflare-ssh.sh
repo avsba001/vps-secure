@@ -907,7 +907,11 @@ probe_path_mtu() {
       high=$((mid - 1))
     fi
   done
-  (( best > 0 )) && printf '%s\n' "$best"
+  if (( best > 0 )); then
+    printf '%s\n' "$best"
+  fi
+  # Empty output means no measurement; the caller selects a fallback.
+  return 0
 }
 
 measure_family_mtu() {
@@ -916,7 +920,11 @@ measure_family_mtu() {
     measured="$(probe_path_mtu "$family" "$target" || true)"
     if [[ "$measured" =~ ^[0-9]+$ ]] && (( measured > best )); then best="$measured"; fi
   done
-  (( best > 0 )) && printf '%s\n' "$best"
+  if (( best > 0 )); then
+    printf '%s\n' "$best"
+  fi
+  # Empty output means no measurement; the caller selects a fallback.
+  return 0
 }
 
 configure_mss_rules() {

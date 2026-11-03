@@ -2,15 +2,16 @@
 set -Eeuo pipefail
 
 # Debian 12 防火墙保护脚本：
-# 1. 屏蔽来自中国 IP 段的 ICMP/ICMPv6。
+# 1. 允许已建立/关联连接和回环；INPUT 默认 DROP。
 # 2. SSH 仅允许 Cloudflare 全部 ASN 当前宣告的 IP 前缀访问。
 # 3. 可选允许中国全量或指定省份 IP 访问 SSH。
-# 4. 使用 ipset 提升匹配性能。
-# 5. 持久化规则、定时更新 IP 段，并在异常时自动回滚。
+# 4. 非 SSH 的 TCP 443 全放行；其余 TCP/ICMP 仅允许非中国集合来源。
+# 5. 允许 DHCPv4 客户端应答 UDP 67 -> 68，其余宿主机入站 DROP。
+# 6. 持久化规则、定时更新 IP 段，并在异常时自动回滚。
 
 SSH_PORT="${SSH_PORT:-}"
 ROLLBACK_SECONDS="${ROLLBACK_SECONDS:-300}"
-ALLOW_ESTABLISHED="${ALLOW_ESTABLISHED:-1}"
+# 已建立/关联连接始终允许，不再提供关闭选项。
 ENABLE_IPV6="${ENABLE_IPV6:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -52,6 +53,8 @@ IPSET_CF4="fwguard_cloudflare_ipv4"
 IPSET_CF6="fwguard_cloudflare_ipv6"
 IPSET_SSH_CN4="fwguard_ssh_cn_ipv4"
 IPSET_SSH_CN6="fwguard_ssh_cn_ipv6"
+CHAIN_INPUT_V4="FWGUARD_INPUT"
+CHAIN_INPUT_V6="FWGUARD_INPUT_V6"
 CHAIN_V4="SSH_CF_ASN_GUARD"
 CHAIN_ICMP_V4="CN_ICMP_DROP"
 CHAIN_V6="SSH_CF_ASN_GUARD_V6"
@@ -227,8 +230,8 @@ prompt_ssh_port() {
     return 0
   fi
 
-  read -r -p "请输入 SSH 端口 [默认 22]：" input
-  SSH_PORT="${input:-22}"
+  read -r -p "请输入 SSH 端口 [默认 22222]：" input
+  SSH_PORT="${input:-22222}"
   validate_ssh_port "$SSH_PORT"
 }
 
@@ -444,6 +447,8 @@ restore_file "$BACKUP_DIR/rules.v6.bak" "$PERSIST_DIR/rules.v6"
 restore_file "$BACKUP_DIR/ipsets.bak" "$IPSET_PERSIST_FILE"
 restore_file "$BACKUP_DIR/ipsets.rules.bak" "$LEGACY_IPSET_PERSIST_FILE"
 restore_file "$BACKUP_DIR/config.bak" "$STATE_DIR/config"
+systemctl disable --now fwguard-firewall-repair.timer >/dev/null 2>&1 || true
+systemctl stop fwguard-firewall-repair.service >/dev/null 2>&1 || true
 systemctl disable --now fwguard-ipset-refresh.timer >/dev/null 2>&1 || true
 systemctl disable --now fwguard-ipset-restore.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf
@@ -480,7 +485,7 @@ migrate_legacy_state() {
 }
 
 download_cn_lists() {
-  echo "正在下载中国 IPv4 地址段（仅用于 ICMP 屏蔽）……"
+  echo "正在下载中国 IPv4 地址段（用于 TCP/ICMP 来源限制）……"
   fetch "$CN_URL" "$STATE_DIR/cn.zone"
   grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$STATE_DIR/cn.zone" > "$STATE_DIR/cn-v4.clean" || true
   if [[ ! -s "$STATE_DIR/cn-v4.clean" ]]; then
@@ -489,7 +494,7 @@ download_cn_lists() {
   fi
 
   if [[ "$ENABLE_IPV6" == "1" ]]; then
-    echo "正在下载中国 IPv6 地址段（仅用于 ICMP 屏蔽）……"
+    echo "正在下载中国 IPv6 地址段（用于 TCP/ICMP 来源限制）……"
     fetch "$CN_IPV6_URL" "$STATE_DIR/cn-v6.zone"
     grep -E '^[0-9a-fA-F:]+/[0-9]+$' "$STATE_DIR/cn-v6.zone" > "$STATE_DIR/cn-v6.clean" || true
     if [[ ! -s "$STATE_DIR/cn-v6.clean" ]]; then
@@ -705,43 +710,6 @@ load_ipsets() {
   fi
 }
 
-ensure_established_rule() {
-  local cmd="$1"
-
-  while "$cmd" -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1; do
-    run "$cmd" -D INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    [[ "$DRY_RUN" == "1" ]] && break
-  done
-  run "$cmd" -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-}
-
-ensure_jump() {
-  local table_cmd="$1"
-  local chain="$2"
-  local proto="$3"
-  local position="${4:-2}"
-  shift 4
-
-  while "$table_cmd" -C INPUT -p "$proto" "$@" -j "$chain" >/dev/null 2>&1; do
-    run "$table_cmd" -D INPUT -p "$proto" "$@" -j "$chain"
-    [[ "$DRY_RUN" == "1" ]] && break
-  done
-  run "$table_cmd" -I INPUT "$position" -p "$proto" "$@" -j "$chain"
-}
-
-ensure_ssh_guard_jump() {
-  local table_cmd="$1"
-  local chain="$2"
-  local port="$3"
-  local position=1
-
-  if [[ "$ALLOW_ESTABLISHED" == "1" ]]; then
-    ensure_established_rule "$table_cmd"
-    position=2
-  fi
-  ensure_jump "$table_cmd" "$chain" tcp "$position" --dport "$port"
-}
-
 ensure_1panel_guard_hooks() {
   local table_cmd="$1"
   local chain="$2"
@@ -862,31 +830,53 @@ remove_input_jumps_to_chain() {
   done
 }
 
+# 所有新入站在 INPUT 首条进入本链，最终 DROP，避免旧规则/1Panel 放行绕过。
+# SSH 分支必须位于 443 和通用 TCP 规则前，SSH_PORT=443 时同样受限。
+apply_host_input_rules() {
+  local cmd="$1" input_chain="$2" ssh_chain="$3" icmp_chain="$4"
+  local cn_set="$5" cf_set="$6" ssh_cn_set="$7" ssh_cn_file="$8" icmp_proto="$9"
+
+  run "$cmd" -N "$ssh_chain" 2>/dev/null || true
+  run "$cmd" -F "$ssh_chain"
+  run "$cmd" -A "$ssh_chain" -m set --match-set "$cf_set" src -j ACCEPT
+  if [[ -s "$ssh_cn_file" ]]; then
+    run "$cmd" -A "$ssh_chain" -m set --match-set "$ssh_cn_set" src -j ACCEPT
+  fi
+  run "$cmd" -A "$ssh_chain" -j DROP
+
+  run "$cmd" -N "$icmp_chain" 2>/dev/null || true
+  run "$cmd" -F "$icmp_chain"
+  run "$cmd" -A "$icmp_chain" -m set --match-set "$cn_set" src -j DROP
+  run "$cmd" -A "$icmp_chain" -j ACCEPT
+
+  run "$cmd" -N "$input_chain" 2>/dev/null || true
+  run "$cmd" -F "$input_chain"
+  run "$cmd" -A "$input_chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  run "$cmd" -A "$input_chain" -i lo -j ACCEPT
+  run "$cmd" -A "$input_chain" -p tcp --dport "$SSH_PORT" -j "$ssh_chain"
+  run "$cmd" -A "$input_chain" -p tcp --dport 443 -j ACCEPT
+  run "$cmd" -A "$input_chain" -p tcp -m set --match-set "$cn_set" src -j DROP
+  run "$cmd" -A "$input_chain" -p tcp -j ACCEPT
+  run "$cmd" -A "$input_chain" -p "$icmp_proto" -j "$icmp_chain"
+  if [[ "$cmd" == "iptables" ]]; then
+    run "$cmd" -A "$input_chain" -p udp --sport 67 --dport 68 -j ACCEPT
+  fi
+  run "$cmd" -A "$input_chain" -j DROP
+
+  # 删除旧挂接，再将完整策略置于 INPUT 首位。
+  remove_input_jumps_to_chain "$cmd" "$input_chain"
+  remove_input_jumps_to_chain "$cmd" "$ssh_chain"
+  remove_input_jumps_to_chain "$cmd" "$icmp_chain"
+  run "$cmd" -I INPUT 1 -j "$input_chain"
+  run "$cmd" -P INPUT DROP
+}
+
 apply_ipv4_rules() {
-  remove_input_jumps_to_chain iptables "$CHAIN_V4"
+  apply_host_input_rules iptables "$CHAIN_INPUT_V4" "$CHAIN_V4" "$CHAIN_ICMP_V4" \
+    "$IPSET_CN4" "$IPSET_CF4" "$IPSET_SSH_CN4" "$STATE_DIR/ssh-cn-v4.clean" icmp
   remove_input_jumps_to_chain iptables "$LEGACY_CHAIN_V4"
-  remove_input_jumps_to_chain iptables "$CHAIN_ICMP_V4"
   run iptables -F "$LEGACY_CHAIN_V4" 2>/dev/null || true
   run iptables -X "$LEGACY_CHAIN_V4" 2>/dev/null || true
-
-  run iptables -N "$CHAIN_V4" 2>/dev/null || true
-  run iptables -F "$CHAIN_V4"
-  run iptables -A "$CHAIN_V4" -m set --match-set "$IPSET_CF4" src -j ACCEPT
-  if [[ -s "$STATE_DIR/ssh-cn-v4.clean" ]]; then
-    run iptables -A "$CHAIN_V4" -m set --match-set "$IPSET_SSH_CN4" src -j ACCEPT
-  fi
-  run iptables -A "$CHAIN_V4" -j DROP
-
-  run iptables -N "$CHAIN_ICMP_V4" 2>/dev/null || true
-  run iptables -F "$CHAIN_ICMP_V4"
-  run iptables -A "$CHAIN_ICMP_V4" -m set --match-set "$IPSET_CN4" src -j DROP
-  run iptables -A "$CHAIN_ICMP_V4" -j RETURN
-
-  ensure_ssh_guard_jump iptables "$CHAIN_V4" "$SSH_PORT"
-  ensure_1panel_guard_hooks iptables "$CHAIN_V4" tcp "$SSH_PORT"
-  ensure_jump iptables "$CHAIN_ICMP_V4" icmp 3
-  ensure_1panel_guard_hooks iptables "$CHAIN_ICMP_V4" icmp
-  warn_early_ssh_accepts iptables "$CHAIN_V4" "$SSH_PORT"
 }
 
 probe_path_mtu() {
@@ -996,44 +986,12 @@ configure_mss_rules() {
 }
 
 apply_ipv6_rules() {
-  if [[ "$ENABLE_IPV6" != "1" ]]; then
-    command -v ip6tables >/dev/null 2>&1 || return 0
-    remove_input_jumps_to_chain ip6tables "$CHAIN_V6"
-    remove_input_jumps_to_chain ip6tables "$LEGACY_CHAIN_V6"
-    remove_input_jumps_to_chain ip6tables "$CHAIN_ICMP_V6"
-    run ip6tables -F "$CHAIN_V6" 2>/dev/null || true
-    run ip6tables -X "$CHAIN_V6" 2>/dev/null || true
-    run ip6tables -F "$CHAIN_ICMP_V6" 2>/dev/null || true
-    run ip6tables -X "$CHAIN_ICMP_V6" 2>/dev/null || true
-    run ip6tables -F "$LEGACY_CHAIN_V6" 2>/dev/null || true
-    run ip6tables -X "$LEGACY_CHAIN_V6" 2>/dev/null || true
-    return 0
-  fi
-
-  remove_input_jumps_to_chain ip6tables "$CHAIN_V6"
+  [[ "$ENABLE_IPV6" == "1" ]] || return 0
+  apply_host_input_rules ip6tables "$CHAIN_INPUT_V6" "$CHAIN_V6" "$CHAIN_ICMP_V6" \
+    "$IPSET_CN6" "$IPSET_CF6" "$IPSET_SSH_CN6" "$STATE_DIR/ssh-cn-v6.clean" ipv6-icmp
   remove_input_jumps_to_chain ip6tables "$LEGACY_CHAIN_V6"
-  remove_input_jumps_to_chain ip6tables "$CHAIN_ICMP_V6"
   run ip6tables -F "$LEGACY_CHAIN_V6" 2>/dev/null || true
   run ip6tables -X "$LEGACY_CHAIN_V6" 2>/dev/null || true
-
-  run ip6tables -N "$CHAIN_V6" 2>/dev/null || true
-  run ip6tables -F "$CHAIN_V6"
-  run ip6tables -A "$CHAIN_V6" -m set --match-set "$IPSET_CF6" src -j ACCEPT
-  if [[ -s "$STATE_DIR/ssh-cn-v6.clean" ]]; then
-    run ip6tables -A "$CHAIN_V6" -m set --match-set "$IPSET_SSH_CN6" src -j ACCEPT
-  fi
-  run ip6tables -A "$CHAIN_V6" -j DROP
-
-  run ip6tables -N "$CHAIN_ICMP_V6" 2>/dev/null || true
-  run ip6tables -F "$CHAIN_ICMP_V6"
-  run ip6tables -A "$CHAIN_ICMP_V6" -m set --match-set "$IPSET_CN6" src -j DROP
-  run ip6tables -A "$CHAIN_ICMP_V6" -j RETURN
-
-  ensure_ssh_guard_jump ip6tables "$CHAIN_V6" "$SSH_PORT"
-  ensure_1panel_guard_hooks ip6tables "$CHAIN_V6" tcp "$SSH_PORT"
-  ensure_jump ip6tables "$CHAIN_ICMP_V6" ipv6-icmp 3
-  ensure_1panel_guard_hooks ip6tables "$CHAIN_ICMP_V6" ipv6-icmp
-  warn_early_ssh_accepts ip6tables "$CHAIN_V6" "$SSH_PORT"
 }
 
 remove_mangle_chain_references() {
@@ -1055,11 +1013,19 @@ uninstall_rules() {
   systemctl disable --now fwguard-ipset-refresh.timer >/dev/null 2>&1 || true
   systemctl disable --now fwguard-ipset-refresh.service >/dev/null 2>&1 || true
   systemctl disable --now fwguard-ipset-restore.service >/dev/null 2>&1 || true
+  iptables -P INPUT ACCEPT
+  remove_input_jumps_to_chain iptables "$CHAIN_INPUT_V4"
+  iptables -F "$CHAIN_INPUT_V4" 2>/dev/null || true
+  iptables -X "$CHAIN_INPUT_V4" 2>/dev/null || true
   remove_input_jumps_to_chain iptables "$CHAIN_V4"
   remove_input_jumps_to_chain iptables "$CHAIN_ICMP_V4"
   remove_1panel_guard_hooks iptables "$CHAIN_V4"
   remove_1panel_guard_hooks iptables "$CHAIN_ICMP_V4"
   if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -P INPUT ACCEPT
+    remove_input_jumps_to_chain ip6tables "$CHAIN_INPUT_V6"
+    ip6tables -F "$CHAIN_INPUT_V6" 2>/dev/null || true
+    ip6tables -X "$CHAIN_INPUT_V6" 2>/dev/null || true
     remove_input_jumps_to_chain ip6tables "$CHAIN_V6"
     remove_input_jumps_to_chain ip6tables "$CHAIN_ICMP_V6"
     remove_1panel_guard_hooks ip6tables "$CHAIN_V6"
@@ -1093,8 +1059,10 @@ uninstall_rules() {
   rm -f /etc/systemd/system/fwguard-ipset-restore.service /etc/systemd/system/fwguard-ipset-refresh.service /etc/systemd/system/fwguard-ipset-refresh.timer /etc/systemd/system/fwguard-firewall-repair.service /etc/systemd/system/fwguard-firewall-repair.timer /etc/systemd/system/netfilter-persistent.service.d/fwguard-ipset.conf
   rmdir /etc/systemd/system/netfilter-persistent.service.d 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
-  persist_rules
-  echo "Firewall and MSS rules removed; unrelated firewall rules preserved."
+  mkdir -p "$PERSIST_DIR"
+  iptables-save > "$PERSIST_DIR/rules.v4"
+  if command -v ip6tables-save >/dev/null 2>&1; then ip6tables-save > "$PERSIST_DIR/rules.v6"; fi
+  echo "已移除本脚本规则并将 INPUT 策略恢复为 ACCEPT，保留其他规则。"
 }
 
 remove_legacy_country_whitelists() {
@@ -1141,7 +1109,6 @@ write_config() {
   cat > "$STATE_DIR/config" <<EOF
 SSH_PORT="$SSH_PORT"
 ROLLBACK_SECONDS="$ROLLBACK_SECONDS"
-ALLOW_ESTABLISHED="$ALLOW_ESTABLISHED"
 ENABLE_IPV6="$ENABLE_IPV6"
   CN_URL="$CN_URL"
   CN_IPV6_URL="$CN_IPV6_URL"
@@ -1225,7 +1192,7 @@ EOF
 
   run tee /etc/systemd/system/fwguard-ipset-refresh.service >/dev/null <<EOF
 [Unit]
-Description=更新 fwguard 的 Cloudflare ASN 和中国 ICMP 地址段
+Description=更新 fwguard 的 Cloudflare ASN 和中国 TCP/ICMP 地址段
 Wants=network-online.target
 After=network-online.target
 
@@ -1304,8 +1271,8 @@ load_config_if_present() {
 repair_firewall_rules() {
   need_root
   load_config_if_present
-  validate_ssh_port "${SSH_PORT:-22}"
-  SSH_PORT="${SSH_PORT:-22}"
+  validate_ssh_port "${SSH_PORT:-22222}"
+  SSH_PORT="${SSH_PORT:-22222}"
 
   if ! ipset list "$IPSET_CF4" >/dev/null 2>&1 || ! ipset list "$IPSET_CN4" >/dev/null 2>&1; then
     echo "ERROR: required fwguard IPv4 sets are missing; run apply or refresh to rebuild them." >&2
@@ -1353,8 +1320,8 @@ refresh_ipsets() {
   validate_deps
   set_stage "读取已保存配置"
   load_config_if_present
-  validate_ssh_port "${SSH_PORT:-22}"
-  SSH_PORT="${SSH_PORT:-22}"
+  validate_ssh_port "${SSH_PORT:-22222}"
+  SSH_PORT="${SSH_PORT:-22222}"
   set_stage "迁移旧版持久化文件"
   migrate_legacy_state
   set_stage "下载 ASN 和 IP 前缀数据"
@@ -1372,7 +1339,7 @@ refresh_ipsets() {
   persist_rules
   trap - ERR
   rm -f "$STATE_DIR/last-refresh-error.log"
-  echo "Cloudflare ASN 前缀和中国 ICMP 地址段已更新，防火墙规则已重新持久化。"
+  echo "Cloudflare ASN 前缀和中国 TCP/ICMP 地址段已更新，防火墙规则已重新持久化。"
 }
 
 confirm_rules() {
@@ -1415,7 +1382,7 @@ diagnose_rules() {
   if [[ -s "$LEGACY_IPSET_PERSIST_FILE" ]]; then
     echo "提示：检测到旧版持久化文件 $LEGACY_IPSET_PERSIST_FILE。"
   fi
-  echo "SSH 端口：${SSH_PORT:-22}"
+  echo "SSH 端口：${SSH_PORT:-22222}"
   echo "SSH 白名单来源：Cloudflare 全部 ASN 当前宣告前缀"
   echo "SSH 中国 IP 白名单模式：${SSH_CN_WHITELIST_MODE:-none}"
   [[ "${SSH_CN_WHITELIST_MODE:-none}" == "province" ]] && echo "SSH 中国省份白名单：$SSH_CN_PROVINCES"
@@ -1441,7 +1408,7 @@ diagnose_rules() {
   echo
 
   echo "== 当前 ipset 状态 =="
-  echo "说明：fwguard_cn_* 仅用于中国 ICMP 屏蔽，不属于 SSH 白名单。"
+  echo "说明：fwguard_cn_* 用于 TCP/ICMP 来源限制；SSH 使用独立白名单。"
   for set_name in "$IPSET_CN4" "$IPSET_CN6" "$IPSET_CF4" "$IPSET_CF6" "$IPSET_SSH_CN4" "$IPSET_SSH_CN6"; do
     if ipset list "$set_name" >/dev/null 2>&1; then
       printf '%s 条目数：' "$set_name"
@@ -1475,13 +1442,16 @@ diagnose_rules() {
   echo
 
   echo "== 当前 iptables 挂接规则 =="
-  iptables -S INPUT 2>/dev/null | grep -E "$CHAIN_V4|$CHAIN_ICMP_V4|ESTABLISHED" || true
-  ip6tables -S INPUT 2>/dev/null | grep -E "$CHAIN_V6|$CHAIN_ICMP_V6|ESTABLISHED" || true
-  warn_early_ssh_accepts iptables "$CHAIN_V4" "${SSH_PORT:-22}"
+  iptables -S INPUT 2>/dev/null | grep -E "$CHAIN_INPUT_V4|$CHAIN_V4|$CHAIN_ICMP_V4|ESTABLISHED|^-P" || true
+  ip6tables -S INPUT 2>/dev/null | grep -E "$CHAIN_INPUT_V6|$CHAIN_V6|$CHAIN_ICMP_V6|ESTABLISHED|^-P" || true
+  warn_early_ssh_accepts iptables "$CHAIN_V4" "${SSH_PORT:-22222}"
   if [[ "$ENABLE_IPV6" == "1" ]]; then
-    warn_early_ssh_accepts ip6tables "$CHAIN_V6" "${SSH_PORT:-22}"
+    warn_early_ssh_accepts ip6tables "$CHAIN_V6" "${SSH_PORT:-22222}"
   fi
   echo
+  echo "== 当前宿主机入站链 =="
+  iptables -S "$CHAIN_INPUT_V4" 2>/dev/null || true
+  if [[ "$ENABLE_IPV6" == "1" ]]; then ip6tables -S "$CHAIN_INPUT_V6" 2>/dev/null || true; fi
   echo "== 当前 SSH 白名单链 =="
   iptables -S "$CHAIN_V4" 2>/dev/null || echo "IPv4 SSH 白名单链缺失"
   if [[ "$ENABLE_IPV6" == "1" ]]; then
@@ -1567,6 +1537,9 @@ Cloudflare ASN：$CLOUDFLARE_ASNS
 Cloudflare ASN 自动发现：$CLOUDFLARE_ASN_AUTO_UPDATE
 SSH 端口：$SSH_PORT
 SSH 白名单：Cloudflare 全部 ASN 当前宣告前缀；$ssh_cn_summary
+入站顺序：已建立/关联、回环 -> SSH 白名单 -> TCP 443 -> 其他 TCP 非中国来源 -> ICMP 非中国来源 -> DHCPv4 应答 -> DROP
+INPUT 默认策略：DROP（IPv6 仅在 ENABLE_IPV6=1 时应用）
+SSH 端口若为 443，仍优先执行 SSH 白名单。
 EOF
 
   cat <<EOF
@@ -1629,7 +1602,7 @@ apply_rules() {
 
 usage() {
   cat <<EOF
-用法：$0 [apply|confirm|rollback|refresh|diagnose]
+用法：$0 [apply|confirm|rollback|refresh|repair|diagnose|uninstall]
 
 命令：
   apply       交互式应用并持久化规则（默认命令）
@@ -1637,16 +1610,18 @@ usage() {
   rollback    使用最近一次备份立即回滚
   refresh     更新 IP 地址段并重新持久化规则
   diagnose    输出重启和持久化诊断信息（也可使用 diag）
+  repair      恢复完整入站规则
+  uninstall   移除本脚本规则，将 INPUT 默认策略设为 ACCEPT
 
 环境变量：
-  SSH_PORT=2222                    跳过 SSH 端口交互输入
+  SSH_PORT=22222                    跳过 SSH 端口交互输入
   SSH_CN_WHITELIST_MODE=none       SSH 中国白名单模式：none/all/province
   SSH_CN_PROVINCES="hubei ..."     省份模式使用，支持中文、拼音或 6 位行政区划代码
   CN_PROVINCE_URL_TEMPLATE=...      省份数据源，使用 %s 代表 6 位行政区划代码
   CLOUDFLARE_ASNS="AS13335 ..."    配合关闭自动发现，覆盖 ASN 清单
   CLOUDFLARE_ASN_AUTO_UPDATE=0      关闭 ASN 自动发现，固定使用配置清单
   ROLLBACK_SECONDS=300             未确认时等待多少秒后回滚
-  ENABLE_IPV6=0                    禁用 IPv6 规则
+  ENABLE_IPV6=0                    不修改 IPv6 规则（已有 IPv6 规则保留）
   PMTU_MTU=1460                    Set both address-family MTUs manually
   PMTU_IPV4_MTU / PMTU_IPV6_MTU    Set each family MTU separately
   PMTU_IPV4_TARGETS / PMTU_IPV6_TARGETS  China-route MTU probe targets

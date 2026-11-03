@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 2. SSH 仅允许 Cloudflare 全部 ASN 当前宣告的 IP 前缀访问。
 # 3. 可选允许中国全量或指定省份 IP 访问 SSH。
 # 4. 非 SSH 的 TCP 443 全放行；其余 TCP/ICMP 仅允许非中国集合来源。
-# 5. 允许 DHCPv4 客户端应答 UDP 67 -> 68，其余宿主机入站 DROP。
+# 5. 所有 UDP 入站允许（含 DHCP 应答）；其余宿主机入站 DROP。
 # 6. 持久化规则、定时更新 IP 段，并在异常时自动回滚。
 
 SSH_PORT="${SSH_PORT:-}"
@@ -858,9 +858,7 @@ apply_host_input_rules() {
   run "$cmd" -A "$input_chain" -p tcp -m set --match-set "$cn_set" src -j DROP
   run "$cmd" -A "$input_chain" -p tcp -j ACCEPT
   run "$cmd" -A "$input_chain" -p "$icmp_proto" -j "$icmp_chain"
-  if [[ "$cmd" == "iptables" ]]; then
-    run "$cmd" -A "$input_chain" -p udp --sport 67 --dport 68 -j ACCEPT
-  fi
+  run "$cmd" -A "$input_chain" -p udp -j ACCEPT
   run "$cmd" -A "$input_chain" -j DROP
 
   # 删除旧挂接，再将完整策略置于 INPUT 首位。
@@ -1537,7 +1535,7 @@ Cloudflare ASN：$CLOUDFLARE_ASNS
 Cloudflare ASN 自动发现：$CLOUDFLARE_ASN_AUTO_UPDATE
 SSH 端口：$SSH_PORT
 SSH 白名单：Cloudflare 全部 ASN 当前宣告前缀；$ssh_cn_summary
-入站顺序：已建立/关联、回环 -> SSH 白名单 -> TCP 443 -> 其他 TCP 非中国来源 -> ICMP 非中国来源 -> DHCPv4 应答 -> DROP
+入站顺序：已建立/关联、回环 -> SSH 白名单 -> TCP 443 -> 其他 TCP 非中国来源 -> ICMP 非中国来源 -> 所有 UDP -> DROP
 INPUT 默认策略：DROP（IPv6 仅在 ENABLE_IPV6=1 时应用）
 SSH 端口若为 443，仍优先执行 SSH 白名单。
 EOF

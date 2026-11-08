@@ -1,0 +1,23 @@
+[
+  {
+    "id": 435378814,
+    "tag_name": "xanmod-cloud-7.3-v3-intel-41806210736",
+    "published_at": "2026-11-05T15:27:14Z",
+    "draft": false,
+    "prerelease": false,
+    "assets": [
+      {
+        "name": "config-7.3-v3-intel-41806210736",
+        "browser_download_url": "https://github.com/avsba001/kernel-build/releases/download/xanmod-cloud-7.3-v3-intel-41806210736/config-7.3-v3-intel-41806210736"
+      },
+      {
+        "name": "linux-headers-7.3.1-x64v3-cloud-v3-intel-xanmod1_7.3.1-gc26b507b7580-1_amd64.deb",
+        "browser_download_url": "https://github.com/avsba001/kernel-build/releases/download/xanmod-cloud-7.3-v3-intel-41806210736/linux-headers-7.3.1-x64v3-cloud-v3-intel-xanmod1_7.3.1-gc26b507b7580-1_amd64.deb"
+      },
+      {
+        "name": "linux-image-7.3.1-x64v3-cloud-v3-intel-xanmod1_7.3.1-gc26b507b7580-1_amd64.deb",
+        "browser_download_url": "https://github.com/avsba001/kernel-build/releases/download/xanmod-cloud-7.3-v3-intel-41806210736/linux-image-7.3.1-x64v3-cloud-v3-intel-xanmod1_7.3.1-gc26b507b7580-1_amd64.deb"
+      }
+    ]
+  }
+]
